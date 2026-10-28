@@ -1,6 +1,6 @@
 # 驗證紀錄
 
-環境：本機 Docker n8n 2.44.7（port 5679）、HubSpot Free（服務金鑰）、demo Gmail（IMAP／SMTP + App password）、Slack `#lead-alerts`。執行日期 2026-10-29（台灣時間）。
+環境：本機 Docker n8n 2.44.7（port 5679）、HubSpot Free（服務金鑰）、demo Gmail（IMAP／SMTP + App password）、Slack（沿用 AI UAT demo workspace 的 incoming webhook，頻道 `#uat-reports`）。執行日期 2026-10-29（台灣時間）。
 
 ## 9.1 離線
 | ID | 指令 | 結果 |

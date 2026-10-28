@@ -169,9 +169,28 @@ def write_results(rows, summary, title, stem="results"):
     print("\n".join(lines))
 
 
+def print_summary(rows, summary, redirect_to, width=104):
+    """Short console view: one wrapped line per scenario, demo inbox address hidden."""
+    for item in rows:
+        observed = item["observed"].replace(redirect_to, "demo inbox") if redirect_to else item["observed"]
+        words, line, out = observed.replace("; ", ", ").split(" "), "", []
+        for word in words:
+            if line and len(line) + 1 + len(word) > width - 10:
+                out.append(line)
+                line = word
+            else:
+                line = f"{line} {word}".strip()
+        out.append(line)
+        print(f"{item['id']:<4}{'PASS' if item['pass'] else 'FAIL'}  {out[0]}")
+        for extra in out[1:]:
+            print(f"{'':10}{extra}")
+    print(f"{summary['passed']} / {summary['total']} passed, {summary['demo_contacts']} demo contacts in HubSpot")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--replay", action="store_true")
+    parser.add_argument("--summary", action="store_true", help="print a short per-scenario view instead of the Markdown table")
     args = parser.parse_args()
     values = load_env()
     fixtures, reviews = load_fixtures()
@@ -191,6 +210,9 @@ def main():
     logs = logs_since(all_logs, batch["run_started"])
     rows, summary = evaluate(fixtures, reviews, logs, batch, latest_send_log("review"), hubspot_state(client),
                              demo_inbox_replies(values, batch["run_started"]), values.get("REPLY_REDIRECT_TO", "").lower())
+    if args.summary:
+        print_summary(rows, summary, values.get("REPLY_REDIRECT_TO", "").lower())
+        return
     write_results(rows, summary, "Lead intake test results (T1–T8)")
 
 

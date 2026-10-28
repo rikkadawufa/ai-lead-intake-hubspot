@@ -81,6 +81,19 @@ Details, including what went wrong along the way, are in [docs/VERIFICATION.md](
 
 WhatsApp or social media intake, an auto-reply chatbot, follow-up sequences, deals or pipeline stages, lead scoring numbers, HubSpot paid features, and production hosting.
 
+## Running this for your own team
+
+This repo runs a demo for a made-up company on localhost. Putting it to work for a real team takes more:
+
+- Hosting n8n somewhere reachable, with sign-in in front of the review page
+- Setting up your HubSpot properties, keys and alert channel
+- Rewriting the sorting rules and the reply tone for your business
+- Connecting your own form and inbox, or a different CRM or channel such as WhatsApp
+- Testing with your real kinds of inquiries before anything goes live
+- Keeping it working when HubSpot, OpenAI or Gmail change something
+
+This is the part I do for clients.
+
 ## Tech stack
 
 - n8n 2.44.7 in Docker, bound to localhost (port 5679)
@@ -95,3 +108,7 @@ WhatsApp or social media intake, an auto-reply chatbot, follow-up sequences, dea
 See [docs/SETUP.md](docs/SETUP.md) to run it, and [docs/OPERATIONS.md](docs/OPERATIONS.md) to change the rules, add a source or handle alerts.
 
 This is a self-initiated portfolio project. The company, people and inquiries are fictional.
+
+## License
+
+Shared as a portfolio sample for review. It is not licensed for reuse.
