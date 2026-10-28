@@ -1,0 +1,1958 @@
+{
+  "id": "wfProcessInquiry",
+  "name": "Lead intake: process inquiry",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "wfErrorHandler"
+  },
+  "nodes": [
+    {
+      "id": "note-find-contact",
+      "name": "Find contact",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -120
+      ],
+      "parameters": {
+        "content": "## 1. Find the contact\nDirect GET by email (consistent right away), then search by phone. A source id already on the contact means a repeat submission: stop here.",
+        "width": 1580,
+        "height": 160,
+        "color": 7
+      }
+    },
+    {
+      "id": "note-classify",
+      "name": "Classify",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        -120
+      ],
+      "parameters": {
+        "content": "## 2. Classify\nOpenAI (or a stored mock answer) sorts the lead. Code checks the enums and that the quote is really in the message. Any failure becomes **Needs review** with no draft and a Slack alert.",
+        "width": 1320,
+        "height": 160,
+        "color": 5
+      }
+    },
+    {
+      "id": "note-write-hubspot",
+      "name": "Write HubSpot",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2940,
+        -120
+      ],
+      "parameters": {
+        "content": "## 3. Write to HubSpot\nUpdate or create the contact (a 409 means it already exists, so update it), then add a note with the original message and the AI reason.",
+        "width": 1540,
+        "height": 160,
+        "color": 4
+      }
+    },
+    {
+      "id": "note-review",
+      "name": "Review",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4540,
+        -120
+      ],
+      "parameters": {
+        "content": "## 4. Human review\nDraft a reply, post the review link to Slack and wait. Nothing is sent until a named reviewer approves; the decision is saved as a note.",
+        "width": 2640,
+        "height": 160,
+        "color": 6
+      }
+    },
+    {
+      "id": "start",
+      "name": "Start",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "has-email",
+      "name": "Has email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-email-condition",
+              "leftValue": "={{ $json.email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "get-contact-by-email",
+      "name": "Get contact by email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/contacts/' + encodeURIComponent($json.email) + '?idProperty=email&properties=email,firstname,lastname,phone,company,lead_tier,inquiry_topic,inquiry_urgency,inquiry_source,ai_reason,inquiry_source_ids' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "autodetect"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "read-email-lookup",
+      "name": "Read email lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Contact matching, de-duplication and the property patch written to HubSpot (SPEC §4).\n\nconst TIER_RANK = { not_qualified: 0, needs_review: 1, qualified: 2 };\n\nfunction readLookup(response) {\n  // HTTP node output with fullResponse + neverError: { statusCode, body }.\n  if (!response || response.statusCode !== 200) return null;\n  const body = response.body || {};\n  if (Array.isArray(body.results)) return body.results[0] || null;\n  return body.id ? body : null;\n}\n\nfunction sourceIds(properties = {}) {\n  return String(properties.inquiry_source_ids || '').split(';').map((value) => value.trim()).filter(Boolean);\n}\n\nfunction checkDuplicate(inquiry, contact) {\n  return Boolean(contact) && sourceIds(contact.properties).includes(inquiry.source_id);\n}\n\nfunction mergeTier(existing, incoming) {\n  if (!existing || !(existing in TIER_RANK)) return incoming;\n  return existing === 'qualified' ? 'qualified' : incoming;\n}\n\nfunction splitName(name) {\n  const parts = String(name || '').trim().split(/\\s+/).filter(Boolean);\n  return { firstname: parts[0] || '', lastname: parts.slice(1).join(' ') };\n}\n\nfunction buildContactProperties(inquiry, qualification, existing = null) {\n  const current = (existing && existing.properties) || {};\n  const ids = sourceIds(current);\n  if (!ids.includes(inquiry.source_id)) ids.push(inquiry.source_id);\n  const properties = {\n    lead_tier: mergeTier(current.lead_tier, qualification.tier),\n    inquiry_topic: qualification.topic,\n    inquiry_urgency: qualification.urgency,\n    inquiry_source: inquiry.source,\n    ai_reason: qualification.reason,\n    inquiry_source_ids: ids.join(';'),\n  };\n  if (inquiry.email && !current.email) properties.email = inquiry.email;\n  if (inquiry.phone && !current.phone) properties.phone = inquiry.phone;\n  if (inquiry.company && !current.company) properties.company = inquiry.company;\n  const name = splitName(inquiry.name);\n  if (name.firstname && !current.firstname) properties.firstname = name.firstname;\n  if (name.lastname && !current.lastname) properties.lastname = name.lastname;\n  return properties;\n}\n\nfunction parseConflictId(response) {\n  if (!response || response.statusCode !== 409) return null;\n  const message = (response.body && response.body.message) || '';\n  const match = message.match(/Existing ID:\\s*(\\d+)/i);\n  return match ? match[1] : null;\n}\n\nreturn [{ json: { inquiry: $('Start').first().json, contact: readLookup($input.first().json) } }];"
+      }
+    },
+    {
+      "id": "skip-email-lookup",
+      "name": "Skip email lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        320
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { inquiry: $('Start').first().json, contact: null } }];"
+      }
+    },
+    {
+      "id": "try-phone",
+      "name": "Try phone?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "try-phone-condition",
+              "leftValue": "={{ !$json.contact && !!$json.inquiry.phone }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "search-contact-by-phone",
+      "name": "Search contact by phone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/contacts/search' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'EQ', value: $json.inquiry.phone }] }], properties: ['email','firstname','lastname','phone','company','lead_tier','inquiry_topic','inquiry_urgency','inquiry_source','ai_reason','inquiry_source_ids'], limit: 1 }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "autodetect"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "read-phone-lookup",
+      "name": "Read phone lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Contact matching, de-duplication and the property patch written to HubSpot (SPEC §4).\n\nconst TIER_RANK = { not_qualified: 0, needs_review: 1, qualified: 2 };\n\nfunction readLookup(response) {\n  // HTTP node output with fullResponse + neverError: { statusCode, body }.\n  if (!response || response.statusCode !== 200) return null;\n  const body = response.body || {};\n  if (Array.isArray(body.results)) return body.results[0] || null;\n  return body.id ? body : null;\n}\n\nfunction sourceIds(properties = {}) {\n  return String(properties.inquiry_source_ids || '').split(';').map((value) => value.trim()).filter(Boolean);\n}\n\nfunction checkDuplicate(inquiry, contact) {\n  return Boolean(contact) && sourceIds(contact.properties).includes(inquiry.source_id);\n}\n\nfunction mergeTier(existing, incoming) {\n  if (!existing || !(existing in TIER_RANK)) return incoming;\n  return existing === 'qualified' ? 'qualified' : incoming;\n}\n\nfunction splitName(name) {\n  const parts = String(name || '').trim().split(/\\s+/).filter(Boolean);\n  return { firstname: parts[0] || '', lastname: parts.slice(1).join(' ') };\n}\n\nfunction buildContactProperties(inquiry, qualification, existing = null) {\n  const current = (existing && existing.properties) || {};\n  const ids = sourceIds(current);\n  if (!ids.includes(inquiry.source_id)) ids.push(inquiry.source_id);\n  const properties = {\n    lead_tier: mergeTier(current.lead_tier, qualification.tier),\n    inquiry_topic: qualification.topic,\n    inquiry_urgency: qualification.urgency,\n    inquiry_source: inquiry.source,\n    ai_reason: qualification.reason,\n    inquiry_source_ids: ids.join(';'),\n  };\n  if (inquiry.email && !current.email) properties.email = inquiry.email;\n  if (inquiry.phone && !current.phone) properties.phone = inquiry.phone;\n  if (inquiry.company && !current.company) properties.company = inquiry.company;\n  const name = splitName(inquiry.name);\n  if (name.firstname && !current.firstname) properties.firstname = name.firstname;\n  if (name.lastname && !current.lastname) properties.lastname = name.lastname;\n  return properties;\n}\n\nfunction parseConflictId(response) {\n  if (!response || response.statusCode !== 409) return null;\n  const message = (response.body && response.body.message) || '';\n  const match = message.match(/Existing ID:\\s*(\\d+)/i);\n  return match ? match[1] : null;\n}\n\nreturn [{ json: { inquiry: $('Start').first().json, contact: readLookup($input.first().json) } }];"
+      }
+    },
+    {
+      "id": "check-duplicate",
+      "name": "Check duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        320
+      ],
+      "parameters": {
+        "jsCode": "// Contact matching, de-duplication and the property patch written to HubSpot (SPEC §4).\n\nconst TIER_RANK = { not_qualified: 0, needs_review: 1, qualified: 2 };\n\nfunction readLookup(response) {\n  // HTTP node output with fullResponse + neverError: { statusCode, body }.\n  if (!response || response.statusCode !== 200) return null;\n  const body = response.body || {};\n  if (Array.isArray(body.results)) return body.results[0] || null;\n  return body.id ? body : null;\n}\n\nfunction sourceIds(properties = {}) {\n  return String(properties.inquiry_source_ids || '').split(';').map((value) => value.trim()).filter(Boolean);\n}\n\nfunction checkDuplicate(inquiry, contact) {\n  return Boolean(contact) && sourceIds(contact.properties).includes(inquiry.source_id);\n}\n\nfunction mergeTier(existing, incoming) {\n  if (!existing || !(existing in TIER_RANK)) return incoming;\n  return existing === 'qualified' ? 'qualified' : incoming;\n}\n\nfunction splitName(name) {\n  const parts = String(name || '').trim().split(/\\s+/).filter(Boolean);\n  return { firstname: parts[0] || '', lastname: parts.slice(1).join(' ') };\n}\n\nfunction buildContactProperties(inquiry, qualification, existing = null) {\n  const current = (existing && existing.properties) || {};\n  const ids = sourceIds(current);\n  if (!ids.includes(inquiry.source_id)) ids.push(inquiry.source_id);\n  const properties = {\n    lead_tier: mergeTier(current.lead_tier, qualification.tier),\n    inquiry_topic: qualification.topic,\n    inquiry_urgency: qualification.urgency,\n    inquiry_source: inquiry.source,\n    ai_reason: qualification.reason,\n    inquiry_source_ids: ids.join(';'),\n  };\n  if (inquiry.email && !current.email) properties.email = inquiry.email;\n  if (inquiry.phone && !current.phone) properties.phone = inquiry.phone;\n  if (inquiry.company && !current.company) properties.company = inquiry.company;\n  const name = splitName(inquiry.name);\n  if (name.firstname && !current.firstname) properties.firstname = name.firstname;\n  if (name.lastname && !current.lastname) properties.lastname = name.lastname;\n  return properties;\n}\n\nfunction parseConflictId(response) {\n  if (!response || response.statusCode !== 409) return null;\n  const message = (response.body && response.body.message) || '';\n  const match = message.match(/Existing ID:\\s*(\\d+)/i);\n  return match ? match[1] : null;\n}\n\nconst { inquiry, contact } = $input.first().json;\nreturn [{ json: { inquiry, contact, duplicate: checkDuplicate(inquiry, contact) } }];"
+      }
+    },
+    {
+      "id": "repeat-submission",
+      "name": "Repeat submission?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1500,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "repeat-submission-condition",
+              "leftValue": "={{ $json.duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "log-repeat-submission",
+      "name": "Log repeat submission",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        520
+      ],
+      "parameters": {
+        "jsCode": "const ctx = $input.first().json;\nreturn [{ json: { runLog: { inquiry: ctx.inquiry, contactId: ctx.contact.id, action: 'duplicate_submission', alerts: [] } } }];"
+      }
+    },
+    {
+      "id": "build-qualify-request",
+      "name": "Build qualify request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\nconst PROMPT = {\"system\":\"You sort inbound inquiries for Tidewell Commercial Cleaning, a (fictional) company that cleans offices, clinics and other commercial spaces in the San Francisco Bay Area. It does not clean private homes.\\n\\nDecide one tier:\\n- qualified: the sender wants cleaning for an office or other commercial space AND gives at least one concrete detail: size, location, frequency or timing.\\n- needs_review: it might be a real request, but key details are missing or the intent is unclear (for example a bare price question).\\n- not_qualified: job applications, sales pitches, spam, or home cleaning (outside our service area).\\n\\nPick the closest topic: regular_cleaning, deep_cleaning, quote_request, complaint, job_application, sales_pitch, other.\\n\\nUrgency:\\n- high: they need it within a week, say it is urgent, or name a date in the next 7 days.\\n- low: no timing at all and not a real request (pitches, applications).\\n- normal: everything else.\\n\\nWrite a one-sentence reason a sales coordinator can check quickly. In \\\"quote\\\", copy a short phrase (under 120 characters) from the message exactly as written, word for word, that supports your decision. Do not invent details. Answer only with the JSON object.\",\"userTemplate\":\"Classify this inquiry.\\n\\n{{inquiry}}\",\"schema\":{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"tier\",\"topic\",\"urgency\",\"reason\",\"quote\"],\"properties\":{\"tier\":{\"type\":\"string\",\"enum\":[\"qualified\",\"needs_review\",\"not_qualified\"]},\"topic\":{\"type\":\"string\",\"enum\":[\"regular_cleaning\",\"deep_cleaning\",\"quote_request\",\"complaint\",\"job_application\",\"sales_pitch\",\"other\"]},\"urgency\":{\"type\":\"string\",\"enum\":[\"high\",\"normal\",\"low\"]},\"reason\":{\"type\":\"string\"},\"quote\":{\"type\":\"string\"}}}};\nconst ctx = $input.first().json;\nreturn [{ json: { ...ctx, request: buildQualifyRequest(ctx.inquiry, PROMPT) } }];"
+      }
+    },
+    {
+      "id": "use-live-llm",
+      "name": "Use live LLM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1940,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "use-live-llm-condition",
+              "leftValue": "={{ $env.LLM_MODE }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "qualify-openai",
+      "name": "Qualify (OpenAI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "openAiCred01",
+          "name": "OpenAI"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.OPENAI_MODEL, ...$json.request }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "load-mock-qualification",
+      "name": "Load mock qualification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        320
+      ],
+      "parameters": {
+        "jsCode": "// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\nconst fs = require('fs');\nconst ctx = $input.first().json;\nconst id = fixtureIdFor(ctx.inquiry.source_id, JSON.parse(require('fs').readFileSync('/files/sample-data/fixtures.json', 'utf8')).fixtures);\nconst file = '/files/sample-data/mock-llm/' + id + '.qualify.json';\nconst content = id && fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';\nreturn [{ json: mockResponse(content, Boolean(ctx.inquiry.demo_flags && ctx.inquiry.demo_flags.break_llm)) }];"
+      }
+    },
+    {
+      "id": "apply-qualification",
+      "name": "Apply qualification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2380,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\n// Contact matching, de-duplication and the property patch written to HubSpot (SPEC §4).\n\nconst TIER_RANK = { not_qualified: 0, needs_review: 1, qualified: 2 };\n\nfunction readLookup(response) {\n  // HTTP node output with fullResponse + neverError: { statusCode, body }.\n  if (!response || response.statusCode !== 200) return null;\n  const body = response.body || {};\n  if (Array.isArray(body.results)) return body.results[0] || null;\n  return body.id ? body : null;\n}\n\nfunction sourceIds(properties = {}) {\n  return String(properties.inquiry_source_ids || '').split(';').map((value) => value.trim()).filter(Boolean);\n}\n\nfunction checkDuplicate(inquiry, contact) {\n  return Boolean(contact) && sourceIds(contact.properties).includes(inquiry.source_id);\n}\n\nfunction mergeTier(existing, incoming) {\n  if (!existing || !(existing in TIER_RANK)) return incoming;\n  return existing === 'qualified' ? 'qualified' : incoming;\n}\n\nfunction splitName(name) {\n  const parts = String(name || '').trim().split(/\\s+/).filter(Boolean);\n  return { firstname: parts[0] || '', lastname: parts.slice(1).join(' ') };\n}\n\nfunction buildContactProperties(inquiry, qualification, existing = null) {\n  const current = (existing && existing.properties) || {};\n  const ids = sourceIds(current);\n  if (!ids.includes(inquiry.source_id)) ids.push(inquiry.source_id);\n  const properties = {\n    lead_tier: mergeTier(current.lead_tier, qualification.tier),\n    inquiry_topic: qualification.topic,\n    inquiry_urgency: qualification.urgency,\n    inquiry_source: inquiry.source,\n    ai_reason: qualification.reason,\n    inquiry_source_ids: ids.join(';'),\n  };\n  if (inquiry.email && !current.email) properties.email = inquiry.email;\n  if (inquiry.phone && !current.phone) properties.phone = inquiry.phone;\n  if (inquiry.company && !current.company) properties.company = inquiry.company;\n  const name = splitName(inquiry.name);\n  if (name.firstname && !current.firstname) properties.firstname = name.firstname;\n  if (name.lastname && !current.lastname) properties.lastname = name.lastname;\n  return properties;\n}\n\nfunction parseConflictId(response) {\n  if (!response || response.statusCode !== 409) return null;\n  const message = (response.body && response.body.message) || '';\n  const match = message.match(/Existing ID:\\s*(\\d+)/i);\n  return match ? match[1] : null;\n}\n\nconst ctx = $('Build qualify request').first().json;\nconst qualification = qualificationFromLlm($input.first().json, ctx.inquiry.message);\nconst properties = buildContactProperties(ctx.inquiry, qualification, ctx.contact);\nreturn [{ json: { inquiry: ctx.inquiry, contact: ctx.contact, qualification, properties, contactId: ctx.contact ? ctx.contact.id : null } }];"
+      }
+    },
+    {
+      "id": "existing-contact",
+      "name": "Existing contact?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2600,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "existing-contact-condition",
+              "leftValue": "={{ $json.contactId }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "create-contact",
+      "name": "Create contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2820,
+        320
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/contacts' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.properties }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "autodetect"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "read-create-result",
+      "name": "Read create result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3040,
+        320
+      ],
+      "parameters": {
+        "jsCode": "// Contact matching, de-duplication and the property patch written to HubSpot (SPEC §4).\n\nconst TIER_RANK = { not_qualified: 0, needs_review: 1, qualified: 2 };\n\nfunction readLookup(response) {\n  // HTTP node output with fullResponse + neverError: { statusCode, body }.\n  if (!response || response.statusCode !== 200) return null;\n  const body = response.body || {};\n  if (Array.isArray(body.results)) return body.results[0] || null;\n  return body.id ? body : null;\n}\n\nfunction sourceIds(properties = {}) {\n  return String(properties.inquiry_source_ids || '').split(';').map((value) => value.trim()).filter(Boolean);\n}\n\nfunction checkDuplicate(inquiry, contact) {\n  return Boolean(contact) && sourceIds(contact.properties).includes(inquiry.source_id);\n}\n\nfunction mergeTier(existing, incoming) {\n  if (!existing || !(existing in TIER_RANK)) return incoming;\n  return existing === 'qualified' ? 'qualified' : incoming;\n}\n\nfunction splitName(name) {\n  const parts = String(name || '').trim().split(/\\s+/).filter(Boolean);\n  return { firstname: parts[0] || '', lastname: parts.slice(1).join(' ') };\n}\n\nfunction buildContactProperties(inquiry, qualification, existing = null) {\n  const current = (existing && existing.properties) || {};\n  const ids = sourceIds(current);\n  if (!ids.includes(inquiry.source_id)) ids.push(inquiry.source_id);\n  const properties = {\n    lead_tier: mergeTier(current.lead_tier, qualification.tier),\n    inquiry_topic: qualification.topic,\n    inquiry_urgency: qualification.urgency,\n    inquiry_source: inquiry.source,\n    ai_reason: qualification.reason,\n    inquiry_source_ids: ids.join(';'),\n  };\n  if (inquiry.email && !current.email) properties.email = inquiry.email;\n  if (inquiry.phone && !current.phone) properties.phone = inquiry.phone;\n  if (inquiry.company && !current.company) properties.company = inquiry.company;\n  const name = splitName(inquiry.name);\n  if (name.firstname && !current.firstname) properties.firstname = name.firstname;\n  if (name.lastname && !current.lastname) properties.lastname = name.lastname;\n  return properties;\n}\n\nfunction parseConflictId(response) {\n  if (!response || response.statusCode !== 409) return null;\n  const message = (response.body && response.body.message) || '';\n  const match = message.match(/Existing ID:\\s*(\\d+)/i);\n  return match ? match[1] : null;\n}\n\nconst res = $input.first().json;\nconst ctx = $('Apply qualification').first().json;\nif (res.statusCode === 200 || res.statusCode === 201) return [{ json: { ...ctx, contactId: res.body.id, conflict: false } }];\nconst existingId = parseConflictId(res);\nif (!existingId) throw new Error('HubSpot create contact failed: ' + res.statusCode + ' ' + JSON.stringify(res.body).slice(0, 300));\nreturn [{ json: { ...ctx, contactId: existingId, conflict: true } }];"
+      }
+    },
+    {
+      "id": "already-exists-409",
+      "name": "Already exists (409)?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3260,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "already-exists-409-condition",
+              "leftValue": "={{ $json.conflict }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "get-existing-contact",
+      "name": "Get existing contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3480,
+        420
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/contacts/' + $json.contactId + '?properties=email,firstname,lastname,phone,company,lead_tier,inquiry_topic,inquiry_urgency,inquiry_source,ai_reason,inquiry_source_ids' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      }
+    },
+    {
+      "id": "rebuild-properties",
+      "name": "Rebuild properties",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3700,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Contact matching, de-duplication and the property patch written to HubSpot (SPEC §4).\n\nconst TIER_RANK = { not_qualified: 0, needs_review: 1, qualified: 2 };\n\nfunction readLookup(response) {\n  // HTTP node output with fullResponse + neverError: { statusCode, body }.\n  if (!response || response.statusCode !== 200) return null;\n  const body = response.body || {};\n  if (Array.isArray(body.results)) return body.results[0] || null;\n  return body.id ? body : null;\n}\n\nfunction sourceIds(properties = {}) {\n  return String(properties.inquiry_source_ids || '').split(';').map((value) => value.trim()).filter(Boolean);\n}\n\nfunction checkDuplicate(inquiry, contact) {\n  return Boolean(contact) && sourceIds(contact.properties).includes(inquiry.source_id);\n}\n\nfunction mergeTier(existing, incoming) {\n  if (!existing || !(existing in TIER_RANK)) return incoming;\n  return existing === 'qualified' ? 'qualified' : incoming;\n}\n\nfunction splitName(name) {\n  const parts = String(name || '').trim().split(/\\s+/).filter(Boolean);\n  return { firstname: parts[0] || '', lastname: parts.slice(1).join(' ') };\n}\n\nfunction buildContactProperties(inquiry, qualification, existing = null) {\n  const current = (existing && existing.properties) || {};\n  const ids = sourceIds(current);\n  if (!ids.includes(inquiry.source_id)) ids.push(inquiry.source_id);\n  const properties = {\n    lead_tier: mergeTier(current.lead_tier, qualification.tier),\n    inquiry_topic: qualification.topic,\n    inquiry_urgency: qualification.urgency,\n    inquiry_source: inquiry.source,\n    ai_reason: qualification.reason,\n    inquiry_source_ids: ids.join(';'),\n  };\n  if (inquiry.email && !current.email) properties.email = inquiry.email;\n  if (inquiry.phone && !current.phone) properties.phone = inquiry.phone;\n  if (inquiry.company && !current.company) properties.company = inquiry.company;\n  const name = splitName(inquiry.name);\n  if (name.firstname && !current.firstname) properties.firstname = name.firstname;\n  if (name.lastname && !current.lastname) properties.lastname = name.lastname;\n  return properties;\n}\n\nfunction parseConflictId(response) {\n  if (!response || response.statusCode !== 409) return null;\n  const message = (response.body && response.body.message) || '';\n  const match = message.match(/Existing ID:\\s*(\\d+)/i);\n  return match ? match[1] : null;\n}\n\nconst ctx = $('Read create result').first().json;\nconst existing = $input.first().json;\nreturn [{ json: { ...ctx, contact: existing, properties: buildContactProperties(ctx.inquiry, ctx.qualification, existing) } }];"
+      }
+    },
+    {
+      "id": "update-contact",
+      "name": "Update contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3920,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/contacts/' + $json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.properties }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "prepare-inquiry-note",
+      "name": "Prepare inquiry note",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// HubSpot notes, Slack texts and the run log; every number here comes from code, not the AI.\n\nfunction escapeNoteHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nconst paragraph = (text) => `<p>${escapeNoteHtml(text).replace(/\\n/g, '<br>')}</p>`;\n\nfunction inquiryNoteHtml(inquiry, qualification) {\n  return [\n    paragraph(`[${inquiry.source}] ${inquiry.received_at}`),\n    inquiry.subject ? paragraph(inquiry.subject) : '',\n    paragraph(inquiry.message),\n    paragraph(`AI: ${qualification.tier} / ${qualification.topic} / ${qualification.urgency} — ${qualification.reason}`),\n  ].join('');\n}\n\nfunction decisionNoteHtml(result, { date, sentTo }) {\n  if (result.timedOut) return paragraph('Reply drafted by AI; review timed out, nothing sent.');\n  if (result.decision === 'approve') return paragraph(`Reply drafted by AI, edited: ${result.edited ? 'yes' : 'no'}, approved by ${result.reviewer} on ${date}, sent to ${sentTo}.\\n\\nSubject: ${result.subject}\\n\\n${result.body}`);\n  return paragraph(`Reply drafted by AI, rejected by ${result.reviewer} on ${date}, nothing sent.`);\n}\n\nfunction noteRequest(contactId, html, timestamp = new Date().toISOString()) {\n  return {\n    properties: { hs_timestamp: timestamp, hs_note_body: html },\n    associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }] }],\n  };\n}\n\nfunction contactUrl(portalId, contactId) {\n  return portalId ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}` : `https://app.hubspot.com/contacts/record/0-1/${contactId}`;\n}\n\nfunction maskSecrets(value) {\n  return String(value ?? '')\n    .replace(/Bearer\\s+[^\\s\"']+/gi, 'Bearer ***')\n    .replace(/\\bsk-[A-Za-z0-9_-]+/g, '***')\n    .replace(/\\bpat-[A-Za-z0-9-]+/g, '***')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/g, 'https://hooks.slack.com/***');\n}\n\nfunction formatAlert(payload = {}, baseUrl = 'http://localhost:5679') {\n  const workflow = payload.workflow || {};\n  const execution = payload.execution || {};\n  const message = maskSecrets((execution.error && execution.error.message) || 'Unknown error');\n  const url = `${baseUrl}/workflow/${workflow.id || ''}/executions/${execution.id || ''}`;\n  return { text: `:rotating_light: Lead intake workflow error\\nWorkflow: ${workflow.name || workflow.id || 'unknown'}\\nNode: ${execution.lastNodeExecuted || 'unknown'}\\nError: ${message}\\n${url}`, url };\n}\n\nfunction rejectedInputAlert(inquiry, reason) {\n  const who = inquiry.email || inquiry.phone || inquiry.name || 'unknown sender';\n  return `:warning: Inquiry not accepted (${reason}) from ${who} via ${inquiry.source}. Nothing was written to HubSpot; please follow up by hand if needed.`;\n}\n\nfunction llmFailureAlert(inquiry, qualification, link) {\n  return `:warning: AI classification failed for ${inquiry.email || inquiry.phone} (${qualification.llm_error}). The lead was saved as Needs review with no draft reply: ${link}`;\n}\n\nfunction reviewAlert(inquiry, qualification, reviewUrl) {\n  return `:incoming_envelope: New lead: ${inquiry.name || inquiry.email} (${qualification.tier}, ${qualification.urgency} urgency) — review the draft reply: ${reviewUrl}`;\n}\n\nfunction buildRunLog({ inquiry, fixtureId = null, contactId = null, action, qualification = null, draft = 'none', sentTo = null, reviewer = null, edited = null, alerts = [], executionId = null }) {\n  return {\n    ts: new Date().toISOString(),\n    execution_id: executionId,\n    source_id: inquiry.source_id,\n    source: inquiry.source,\n    fixture_id: fixtureId,\n    email: inquiry.email,\n    contact_id: contactId,\n    action,\n    tier: qualification ? qualification.tier : null,\n    llm_ok: qualification ? qualification.llm_ok : null,\n    llm_error: qualification ? qualification.llm_error : null,\n    draft,\n    reviewer,\n    edited,\n    sent_to: sentTo,\n    alerts,\n  };\n}\n\nconst created = $('Read create result').isExecuted ? $('Read create result').first().json : null;\nconst wasCreated = Boolean(created && !created.conflict);\nconst ctx = wasCreated ? created : ($('Rebuild properties').isExecuted ? $('Rebuild properties').first().json : $('Apply qualification').first().json);\nconst contactId = String(wasCreated ? created.contactId : $input.first().json.id);\nconst html = inquiryNoteHtml(ctx.inquiry, ctx.qualification);\nreturn [{ json: { ...ctx, contactId, action: wasCreated ? 'created' : 'updated', note: noteRequest(contactId, html, ctx.inquiry.received_at) } }];"
+      }
+    },
+    {
+      "id": "create-inquiry-note",
+      "name": "Create inquiry note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4360,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/notes' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.note) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "restore-context",
+      "name": "Restore context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4580,
+        200
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $('Prepare inquiry note').first().json }];"
+      }
+    },
+    {
+      "id": "draft-a-reply",
+      "name": "Draft a reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4800,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "draft-a-reply-condition",
+              "leftValue": "={{ $json.qualification.llm_ok && $json.qualification.tier !== 'not_qualified' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "log-without-draft",
+      "name": "Log without draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5020,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// HubSpot notes, Slack texts and the run log; every number here comes from code, not the AI.\n\nfunction escapeNoteHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nconst paragraph = (text) => `<p>${escapeNoteHtml(text).replace(/\\n/g, '<br>')}</p>`;\n\nfunction inquiryNoteHtml(inquiry, qualification) {\n  return [\n    paragraph(`[${inquiry.source}] ${inquiry.received_at}`),\n    inquiry.subject ? paragraph(inquiry.subject) : '',\n    paragraph(inquiry.message),\n    paragraph(`AI: ${qualification.tier} / ${qualification.topic} / ${qualification.urgency} — ${qualification.reason}`),\n  ].join('');\n}\n\nfunction decisionNoteHtml(result, { date, sentTo }) {\n  if (result.timedOut) return paragraph('Reply drafted by AI; review timed out, nothing sent.');\n  if (result.decision === 'approve') return paragraph(`Reply drafted by AI, edited: ${result.edited ? 'yes' : 'no'}, approved by ${result.reviewer} on ${date}, sent to ${sentTo}.\\n\\nSubject: ${result.subject}\\n\\n${result.body}`);\n  return paragraph(`Reply drafted by AI, rejected by ${result.reviewer} on ${date}, nothing sent.`);\n}\n\nfunction noteRequest(contactId, html, timestamp = new Date().toISOString()) {\n  return {\n    properties: { hs_timestamp: timestamp, hs_note_body: html },\n    associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }] }],\n  };\n}\n\nfunction contactUrl(portalId, contactId) {\n  return portalId ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}` : `https://app.hubspot.com/contacts/record/0-1/${contactId}`;\n}\n\nfunction maskSecrets(value) {\n  return String(value ?? '')\n    .replace(/Bearer\\s+[^\\s\"']+/gi, 'Bearer ***')\n    .replace(/\\bsk-[A-Za-z0-9_-]+/g, '***')\n    .replace(/\\bpat-[A-Za-z0-9-]+/g, '***')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/g, 'https://hooks.slack.com/***');\n}\n\nfunction formatAlert(payload = {}, baseUrl = 'http://localhost:5679') {\n  const workflow = payload.workflow || {};\n  const execution = payload.execution || {};\n  const message = maskSecrets((execution.error && execution.error.message) || 'Unknown error');\n  const url = `${baseUrl}/workflow/${workflow.id || ''}/executions/${execution.id || ''}`;\n  return { text: `:rotating_light: Lead intake workflow error\\nWorkflow: ${workflow.name || workflow.id || 'unknown'}\\nNode: ${execution.lastNodeExecuted || 'unknown'}\\nError: ${message}\\n${url}`, url };\n}\n\nfunction rejectedInputAlert(inquiry, reason) {\n  const who = inquiry.email || inquiry.phone || inquiry.name || 'unknown sender';\n  return `:warning: Inquiry not accepted (${reason}) from ${who} via ${inquiry.source}. Nothing was written to HubSpot; please follow up by hand if needed.`;\n}\n\nfunction llmFailureAlert(inquiry, qualification, link) {\n  return `:warning: AI classification failed for ${inquiry.email || inquiry.phone} (${qualification.llm_error}). The lead was saved as Needs review with no draft reply: ${link}`;\n}\n\nfunction reviewAlert(inquiry, qualification, reviewUrl) {\n  return `:incoming_envelope: New lead: ${inquiry.name || inquiry.email} (${qualification.tier}, ${qualification.urgency} urgency) — review the draft reply: ${reviewUrl}`;\n}\n\nfunction buildRunLog({ inquiry, fixtureId = null, contactId = null, action, qualification = null, draft = 'none', sentTo = null, reviewer = null, edited = null, alerts = [], executionId = null }) {\n  return {\n    ts: new Date().toISOString(),\n    execution_id: executionId,\n    source_id: inquiry.source_id,\n    source: inquiry.source,\n    fixture_id: fixtureId,\n    email: inquiry.email,\n    contact_id: contactId,\n    action,\n    tier: qualification ? qualification.tier : null,\n    llm_ok: qualification ? qualification.llm_ok : null,\n    llm_error: qualification ? qualification.llm_error : null,\n    draft,\n    reviewer,\n    edited,\n    sent_to: sentTo,\n    alerts,\n  };\n}\n\nconst ctx = $input.first().json;\nconst link = contactUrl($env.HUBSPOT_PORTAL_ID, ctx.contactId);\nconst alerts = ctx.qualification.llm_ok ? [] : [llmFailureAlert(ctx.inquiry, ctx.qualification, link)];\nreturn [{ json: { runLog: { inquiry: ctx.inquiry, contactId: ctx.contactId, action: ctx.action, qualification: ctx.qualification, draft: 'none', alerts } } }];"
+      }
+    },
+    {
+      "id": "build-draft-request",
+      "name": "Build draft request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5020,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\nconst PROMPT = {\"system\":\"You write first replies for Tidewell Commercial Cleaning (a fictional company that cleans offices and commercial spaces in the San Francisco Bay Area).\\n\\nRules:\\n- Plain, friendly US English. Under 120 words. No marketing language.\\n- Greet the sender by first name if it is known.\\n- Respond to what they actually asked.\\n- If the tier is needs_review, ask for the one or two details that are missing (for example size, location or how often).\\n- Offer a short call or an on-site walkthrough as the next step.\\n- Never promise a price, a discount or a specific date or time. Never invent facts about the company.\\n- Sign off as \\\"Tidewell Commercial Cleaning team\\\".\\n- The subject should read like a reply, for example \\\"Re: <their topic>\\\".\",\"userTemplate\":\"Tier: {{tier}}\\nTopic: {{topic}}\\nUrgency: {{urgency}}\\n\\n{{inquiry}}\",\"schema\":{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"subject\",\"body\"],\"properties\":{\"subject\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}}}};\nconst ctx = $input.first().json;\nreturn [{ json: { ...ctx, request: buildDraftRequest(ctx.inquiry, ctx.qualification, PROMPT) } }];"
+      }
+    },
+    {
+      "id": "use-live-llm-draft",
+      "name": "Use live LLM? (draft)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5240,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "use-live-llm-draft-condition",
+              "leftValue": "={{ $env.LLM_MODE }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "draft-reply-openai",
+      "name": "Draft reply (OpenAI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5460,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "openAiCred01",
+          "name": "OpenAI"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.OPENAI_MODEL, ...$json.request }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "load-mock-draft",
+      "name": "Load mock draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5460,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\nconst fs = require('fs');\nconst ctx = $input.first().json;\nconst id = fixtureIdFor(ctx.inquiry.source_id, JSON.parse(require('fs').readFileSync('/files/sample-data/fixtures.json', 'utf8')).fixtures);\nconst file = '/files/sample-data/mock-llm/' + id + '.draft.json';\nconst content = id && fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';\nreturn [{ json: mockResponse(content, false) }];"
+      }
+    },
+    {
+      "id": "check-draft",
+      "name": "Check draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5680,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\nconst ctx = $('Build draft request').first().json;\nconst { request, ...rest } = ctx;\nreturn [{ json: { ...rest, draft: draftFromLlm($input.first().json) } }];"
+      }
+    },
+    {
+      "id": "draft-usable",
+      "name": "Draft usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5900,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "draft-usable-condition",
+              "leftValue": "={{ $json.draft.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "log-draft-failure",
+      "name": "Log draft failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6120,
+        320
+      ],
+      "parameters": {
+        "jsCode": "// HubSpot notes, Slack texts and the run log; every number here comes from code, not the AI.\n\nfunction escapeNoteHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nconst paragraph = (text) => `<p>${escapeNoteHtml(text).replace(/\\n/g, '<br>')}</p>`;\n\nfunction inquiryNoteHtml(inquiry, qualification) {\n  return [\n    paragraph(`[${inquiry.source}] ${inquiry.received_at}`),\n    inquiry.subject ? paragraph(inquiry.subject) : '',\n    paragraph(inquiry.message),\n    paragraph(`AI: ${qualification.tier} / ${qualification.topic} / ${qualification.urgency} — ${qualification.reason}`),\n  ].join('');\n}\n\nfunction decisionNoteHtml(result, { date, sentTo }) {\n  if (result.timedOut) return paragraph('Reply drafted by AI; review timed out, nothing sent.');\n  if (result.decision === 'approve') return paragraph(`Reply drafted by AI, edited: ${result.edited ? 'yes' : 'no'}, approved by ${result.reviewer} on ${date}, sent to ${sentTo}.\\n\\nSubject: ${result.subject}\\n\\n${result.body}`);\n  return paragraph(`Reply drafted by AI, rejected by ${result.reviewer} on ${date}, nothing sent.`);\n}\n\nfunction noteRequest(contactId, html, timestamp = new Date().toISOString()) {\n  return {\n    properties: { hs_timestamp: timestamp, hs_note_body: html },\n    associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }] }],\n  };\n}\n\nfunction contactUrl(portalId, contactId) {\n  return portalId ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}` : `https://app.hubspot.com/contacts/record/0-1/${contactId}`;\n}\n\nfunction maskSecrets(value) {\n  return String(value ?? '')\n    .replace(/Bearer\\s+[^\\s\"']+/gi, 'Bearer ***')\n    .replace(/\\bsk-[A-Za-z0-9_-]+/g, '***')\n    .replace(/\\bpat-[A-Za-z0-9-]+/g, '***')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/g, 'https://hooks.slack.com/***');\n}\n\nfunction formatAlert(payload = {}, baseUrl = 'http://localhost:5679') {\n  const workflow = payload.workflow || {};\n  const execution = payload.execution || {};\n  const message = maskSecrets((execution.error && execution.error.message) || 'Unknown error');\n  const url = `${baseUrl}/workflow/${workflow.id || ''}/executions/${execution.id || ''}`;\n  return { text: `:rotating_light: Lead intake workflow error\\nWorkflow: ${workflow.name || workflow.id || 'unknown'}\\nNode: ${execution.lastNodeExecuted || 'unknown'}\\nError: ${message}\\n${url}`, url };\n}\n\nfunction rejectedInputAlert(inquiry, reason) {\n  const who = inquiry.email || inquiry.phone || inquiry.name || 'unknown sender';\n  return `:warning: Inquiry not accepted (${reason}) from ${who} via ${inquiry.source}. Nothing was written to HubSpot; please follow up by hand if needed.`;\n}\n\nfunction llmFailureAlert(inquiry, qualification, link) {\n  return `:warning: AI classification failed for ${inquiry.email || inquiry.phone} (${qualification.llm_error}). The lead was saved as Needs review with no draft reply: ${link}`;\n}\n\nfunction reviewAlert(inquiry, qualification, reviewUrl) {\n  return `:incoming_envelope: New lead: ${inquiry.name || inquiry.email} (${qualification.tier}, ${qualification.urgency} urgency) — review the draft reply: ${reviewUrl}`;\n}\n\nfunction buildRunLog({ inquiry, fixtureId = null, contactId = null, action, qualification = null, draft = 'none', sentTo = null, reviewer = null, edited = null, alerts = [], executionId = null }) {\n  return {\n    ts: new Date().toISOString(),\n    execution_id: executionId,\n    source_id: inquiry.source_id,\n    source: inquiry.source,\n    fixture_id: fixtureId,\n    email: inquiry.email,\n    contact_id: contactId,\n    action,\n    tier: qualification ? qualification.tier : null,\n    llm_ok: qualification ? qualification.llm_ok : null,\n    llm_error: qualification ? qualification.llm_error : null,\n    draft,\n    reviewer,\n    edited,\n    sent_to: sentTo,\n    alerts,\n  };\n}\n\nconst ctx = $input.first().json;\nconst alert = ':warning: AI reply draft failed (' + ctx.draft.error + ') for ' + (ctx.inquiry.email || ctx.inquiry.phone) + '. The lead is in HubSpot; please write the reply by hand: ' + contactUrl($env.HUBSPOT_PORTAL_ID, ctx.contactId);\nreturn [{ json: { runLog: { inquiry: ctx.inquiry, contactId: ctx.contactId, action: ctx.action, qualification: ctx.qualification, draft: 'none', alerts: [alert] } } }];"
+      }
+    },
+    {
+      "id": "build-review-page",
+      "name": "Build review page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6120,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Human approval: review page, decision parsing and the outgoing reply (SPEC §6).\n\nfunction escapeHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;');\n}\n\nfunction safeId(sourceId) {\n  return String(sourceId || 'unknown').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);\n}\n\nconst TIER_LABEL = { qualified: 'Qualified', needs_review: 'Needs review', not_qualified: 'Not qualified' };\n\nfunction buildReviewPage({ inquiry, qualification, draft, contactUrl, resumeUrl }) {\n  const row = (label, value) => `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`;\n  return `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Reply review: ${escapeHtml(inquiry.name || inquiry.email || 'new lead')}</title>\n<style>body{font:16px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 16px;background:#f4f6f8;color:#1d2430}\nsection{background:#fff;border-radius:10px;padding:1rem 1.25rem;margin:1rem 0;box-shadow:0 1px 2px #0001}\nh1{font-size:1.4rem}h2{font-size:1.05rem;margin:.2rem 0 .8rem}th{text-align:left;color:#5b6575;font-weight:600;padding:.2rem 1rem .2rem 0;vertical-align:top;white-space:nowrap}\n.msg{white-space:pre-wrap;background:#f7f8fa;border-radius:6px;padding:.75rem}.tier{display:inline-block;border-radius:999px;padding:.1rem .6rem;background:#e7f0ff;color:#1747a6;font-weight:600}\nlabel{display:block;margin:.8rem 0 .3rem;font-weight:600}input[type=text],textarea{width:100%;box-sizing:border-box;font:inherit;padding:.5rem;border:1px solid #c9cfd8;border-radius:6px}\ntextarea{min-height:12rem}.choices label{display:inline-block;font-weight:500;margin-right:1.5rem}button{font:inherit;font-weight:600;background:#1d4ed8;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;cursor:pointer}\n.note{color:#5b6575;font-size:.9rem}</style></head><body>\n<h1>Review the AI draft before anything is sent</h1>\n<section><h2>Inquiry</h2><table>\n${row('From', `${inquiry.name || '(no name)'} <${inquiry.email || 'no email'}>`)}\n${row('Phone', inquiry.phone || '(not given)')}\n${row('Company', inquiry.company || '(not given)')}\n${row('Source', `${inquiry.source} · ${inquiry.received_at}`)}\n${row('Subject', inquiry.subject || '(none)')}\n</table><p class=\"msg\">${escapeHtml(inquiry.message)}</p>\n<p><a href=\"${escapeHtml(contactUrl)}\">Open contact in HubSpot</a></p></section>\n<section><h2>AI classification</h2><p><span class=\"tier\">${escapeHtml(TIER_LABEL[qualification.tier] || qualification.tier)}</span> · ${escapeHtml(qualification.topic)} · urgency ${escapeHtml(qualification.urgency)}</p><p>${escapeHtml(qualification.reason)}</p></section>\n<section><h2>Draft reply</h2><form method=\"POST\" action=\"${escapeHtml(resumeUrl)}\" enctype=\"application/x-www-form-urlencoded\">\n<label for=\"subject\">Subject</label><input type=\"text\" id=\"subject\" name=\"subject\" value=\"${escapeHtml(draft.subject)}\">\n<label for=\"body\">Message</label><textarea id=\"body\" name=\"body\">${escapeHtml(draft.body)}</textarea>\n<label>Decision</label><div class=\"choices\"><label><input type=\"radio\" name=\"decision\" value=\"approve\"> Approve and send</label><label><input type=\"radio\" name=\"decision\" value=\"reject\"> Reject, send nothing</label></div>\n<label for=\"reviewer\">Your name</label><input type=\"text\" id=\"reviewer\" name=\"reviewer\" required>\n<p class=\"note\">Nothing is sent until you approve. Your name is saved on the HubSpot contact with the decision.</p>\n<button type=\"submit\">Submit review</button></form></section></body></html>`;\n}\n\nfunction parseDecision(body, draft) {\n  if (body == null) return { timedOut: true, errors: [] };\n  const errors = [];\n  const reviewer = String(body.reviewer || '').trim();\n  const decision = String(body.decision || '').trim();\n  if (!reviewer) errors.push('Your name is required');\n  if (!['approve', 'reject'].includes(decision)) errors.push('Choose Approve or Reject');\n  const subject = String(body.subject ?? draft.subject).trim();\n  const text = String(body.body ?? draft.body).replace(/\\r\\n/g, '\\n').trim();\n  if (decision === 'approve' && (!subject || !text)) errors.push('Subject and message cannot be empty');\n  const edited = subject !== String(draft.subject).trim() || text !== String(draft.body).replace(/\\r\\n/g, '\\n').trim();\n  return { timedOut: false, errors, reviewer, decision, subject, body: text, edited };\n}\n\nfunction outgoingEmail({ to, subject, body, demoMode, redirectTo }) {\n  if (demoMode) {\n    if (!redirectTo) throw new Error('DEMO_MODE=1 needs REPLY_REDIRECT_TO; refusing to email a demo address');\n    return { to: redirectTo, subject: `[demo → ${to}] ${subject}`, body };\n  }\n  return { to, subject, body };\n}\n\nfunction errorPage(errors) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review not accepted</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>Review not accepted</h1><ul>${errors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}</ul><p>Go back, fix the form and submit again. Nothing was sent.</p></body></html>`;\n}\n\nfunction receiptPage(text) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review received</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>${escapeHtml(text)}</h1></body></html>`;\n}\n\n// HubSpot notes, Slack texts and the run log; every number here comes from code, not the AI.\n\nfunction escapeNoteHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nconst paragraph = (text) => `<p>${escapeNoteHtml(text).replace(/\\n/g, '<br>')}</p>`;\n\nfunction inquiryNoteHtml(inquiry, qualification) {\n  return [\n    paragraph(`[${inquiry.source}] ${inquiry.received_at}`),\n    inquiry.subject ? paragraph(inquiry.subject) : '',\n    paragraph(inquiry.message),\n    paragraph(`AI: ${qualification.tier} / ${qualification.topic} / ${qualification.urgency} — ${qualification.reason}`),\n  ].join('');\n}\n\nfunction decisionNoteHtml(result, { date, sentTo }) {\n  if (result.timedOut) return paragraph('Reply drafted by AI; review timed out, nothing sent.');\n  if (result.decision === 'approve') return paragraph(`Reply drafted by AI, edited: ${result.edited ? 'yes' : 'no'}, approved by ${result.reviewer} on ${date}, sent to ${sentTo}.\\n\\nSubject: ${result.subject}\\n\\n${result.body}`);\n  return paragraph(`Reply drafted by AI, rejected by ${result.reviewer} on ${date}, nothing sent.`);\n}\n\nfunction noteRequest(contactId, html, timestamp = new Date().toISOString()) {\n  return {\n    properties: { hs_timestamp: timestamp, hs_note_body: html },\n    associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }] }],\n  };\n}\n\nfunction contactUrl(portalId, contactId) {\n  return portalId ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}` : `https://app.hubspot.com/contacts/record/0-1/${contactId}`;\n}\n\nfunction maskSecrets(value) {\n  return String(value ?? '')\n    .replace(/Bearer\\s+[^\\s\"']+/gi, 'Bearer ***')\n    .replace(/\\bsk-[A-Za-z0-9_-]+/g, '***')\n    .replace(/\\bpat-[A-Za-z0-9-]+/g, '***')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/g, 'https://hooks.slack.com/***');\n}\n\nfunction formatAlert(payload = {}, baseUrl = 'http://localhost:5679') {\n  const workflow = payload.workflow || {};\n  const execution = payload.execution || {};\n  const message = maskSecrets((execution.error && execution.error.message) || 'Unknown error');\n  const url = `${baseUrl}/workflow/${workflow.id || ''}/executions/${execution.id || ''}`;\n  return { text: `:rotating_light: Lead intake workflow error\\nWorkflow: ${workflow.name || workflow.id || 'unknown'}\\nNode: ${execution.lastNodeExecuted || 'unknown'}\\nError: ${message}\\n${url}`, url };\n}\n\nfunction rejectedInputAlert(inquiry, reason) {\n  const who = inquiry.email || inquiry.phone || inquiry.name || 'unknown sender';\n  return `:warning: Inquiry not accepted (${reason}) from ${who} via ${inquiry.source}. Nothing was written to HubSpot; please follow up by hand if needed.`;\n}\n\nfunction llmFailureAlert(inquiry, qualification, link) {\n  return `:warning: AI classification failed for ${inquiry.email || inquiry.phone} (${qualification.llm_error}). The lead was saved as Needs review with no draft reply: ${link}`;\n}\n\nfunction reviewAlert(inquiry, qualification, reviewUrl) {\n  return `:incoming_envelope: New lead: ${inquiry.name || inquiry.email} (${qualification.tier}, ${qualification.urgency} urgency) — review the draft reply: ${reviewUrl}`;\n}\n\nfunction buildRunLog({ inquiry, fixtureId = null, contactId = null, action, qualification = null, draft = 'none', sentTo = null, reviewer = null, edited = null, alerts = [], executionId = null }) {\n  return {\n    ts: new Date().toISOString(),\n    execution_id: executionId,\n    source_id: inquiry.source_id,\n    source: inquiry.source,\n    fixture_id: fixtureId,\n    email: inquiry.email,\n    contact_id: contactId,\n    action,\n    tier: qualification ? qualification.tier : null,\n    llm_ok: qualification ? qualification.llm_ok : null,\n    llm_error: qualification ? qualification.llm_error : null,\n    draft,\n    reviewer,\n    edited,\n    sent_to: sentTo,\n    alerts,\n  };\n}\n\nconst fs = require('fs');\nconst ctx = $input.first().json;\nconst reviewId = safeId(ctx.inquiry.source_id);\nconst resumeUrl = $execution.resumeUrl;\nconst page = buildReviewPage({ inquiry: ctx.inquiry, qualification: ctx.qualification, draft: ctx.draft, contactUrl: contactUrl($env.HUBSPOT_PORTAL_ID, ctx.contactId), resumeUrl });\nfs.mkdirSync('/files/output/review', { recursive: true });\nfs.writeFileSync('/files/output/review/' + reviewId + '.html', page, 'utf8');\nfs.writeFileSync('/files/output/review/' + reviewId + '.json', JSON.stringify({ source_id: ctx.inquiry.source_id, resume_url: resumeUrl, execution_id: $execution.id, status: 'pending', created_at: new Date().toISOString() }, null, 2), 'utf8');\nconst reviewUrl = ($env.WEBHOOK_URL || 'http://localhost:5679/') + 'webhook/review?id=' + encodeURIComponent(reviewId);\nreturn [{ json: { ...ctx, reviewId, reviewUrl, slackText: reviewAlert(ctx.inquiry, ctx.qualification, reviewUrl) } }];"
+      }
+    },
+    {
+      "id": "notify-reviewer",
+      "name": "Notify reviewer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6340,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.slackText }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "wait-for-review",
+      "name": "Wait for review",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        6560,
+        0
+      ],
+      "webhookId": "0a123234-f134-dafd-9cea-a8b6aa0f595e",
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 72,
+        "resumeUnit": "hours",
+        "options": {}
+      }
+    },
+    {
+      "id": "read-decision",
+      "name": "Read decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6780,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Human approval: review page, decision parsing and the outgoing reply (SPEC §6).\n\nfunction escapeHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;');\n}\n\nfunction safeId(sourceId) {\n  return String(sourceId || 'unknown').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);\n}\n\nconst TIER_LABEL = { qualified: 'Qualified', needs_review: 'Needs review', not_qualified: 'Not qualified' };\n\nfunction buildReviewPage({ inquiry, qualification, draft, contactUrl, resumeUrl }) {\n  const row = (label, value) => `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`;\n  return `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Reply review: ${escapeHtml(inquiry.name || inquiry.email || 'new lead')}</title>\n<style>body{font:16px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 16px;background:#f4f6f8;color:#1d2430}\nsection{background:#fff;border-radius:10px;padding:1rem 1.25rem;margin:1rem 0;box-shadow:0 1px 2px #0001}\nh1{font-size:1.4rem}h2{font-size:1.05rem;margin:.2rem 0 .8rem}th{text-align:left;color:#5b6575;font-weight:600;padding:.2rem 1rem .2rem 0;vertical-align:top;white-space:nowrap}\n.msg{white-space:pre-wrap;background:#f7f8fa;border-radius:6px;padding:.75rem}.tier{display:inline-block;border-radius:999px;padding:.1rem .6rem;background:#e7f0ff;color:#1747a6;font-weight:600}\nlabel{display:block;margin:.8rem 0 .3rem;font-weight:600}input[type=text],textarea{width:100%;box-sizing:border-box;font:inherit;padding:.5rem;border:1px solid #c9cfd8;border-radius:6px}\ntextarea{min-height:12rem}.choices label{display:inline-block;font-weight:500;margin-right:1.5rem}button{font:inherit;font-weight:600;background:#1d4ed8;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;cursor:pointer}\n.note{color:#5b6575;font-size:.9rem}</style></head><body>\n<h1>Review the AI draft before anything is sent</h1>\n<section><h2>Inquiry</h2><table>\n${row('From', `${inquiry.name || '(no name)'} <${inquiry.email || 'no email'}>`)}\n${row('Phone', inquiry.phone || '(not given)')}\n${row('Company', inquiry.company || '(not given)')}\n${row('Source', `${inquiry.source} · ${inquiry.received_at}`)}\n${row('Subject', inquiry.subject || '(none)')}\n</table><p class=\"msg\">${escapeHtml(inquiry.message)}</p>\n<p><a href=\"${escapeHtml(contactUrl)}\">Open contact in HubSpot</a></p></section>\n<section><h2>AI classification</h2><p><span class=\"tier\">${escapeHtml(TIER_LABEL[qualification.tier] || qualification.tier)}</span> · ${escapeHtml(qualification.topic)} · urgency ${escapeHtml(qualification.urgency)}</p><p>${escapeHtml(qualification.reason)}</p></section>\n<section><h2>Draft reply</h2><form method=\"POST\" action=\"${escapeHtml(resumeUrl)}\" enctype=\"application/x-www-form-urlencoded\">\n<label for=\"subject\">Subject</label><input type=\"text\" id=\"subject\" name=\"subject\" value=\"${escapeHtml(draft.subject)}\">\n<label for=\"body\">Message</label><textarea id=\"body\" name=\"body\">${escapeHtml(draft.body)}</textarea>\n<label>Decision</label><div class=\"choices\"><label><input type=\"radio\" name=\"decision\" value=\"approve\"> Approve and send</label><label><input type=\"radio\" name=\"decision\" value=\"reject\"> Reject, send nothing</label></div>\n<label for=\"reviewer\">Your name</label><input type=\"text\" id=\"reviewer\" name=\"reviewer\" required>\n<p class=\"note\">Nothing is sent until you approve. Your name is saved on the HubSpot contact with the decision.</p>\n<button type=\"submit\">Submit review</button></form></section></body></html>`;\n}\n\nfunction parseDecision(body, draft) {\n  if (body == null) return { timedOut: true, errors: [] };\n  const errors = [];\n  const reviewer = String(body.reviewer || '').trim();\n  const decision = String(body.decision || '').trim();\n  if (!reviewer) errors.push('Your name is required');\n  if (!['approve', 'reject'].includes(decision)) errors.push('Choose Approve or Reject');\n  const subject = String(body.subject ?? draft.subject).trim();\n  const text = String(body.body ?? draft.body).replace(/\\r\\n/g, '\\n').trim();\n  if (decision === 'approve' && (!subject || !text)) errors.push('Subject and message cannot be empty');\n  const edited = subject !== String(draft.subject).trim() || text !== String(draft.body).replace(/\\r\\n/g, '\\n').trim();\n  return { timedOut: false, errors, reviewer, decision, subject, body: text, edited };\n}\n\nfunction outgoingEmail({ to, subject, body, demoMode, redirectTo }) {\n  if (demoMode) {\n    if (!redirectTo) throw new Error('DEMO_MODE=1 needs REPLY_REDIRECT_TO; refusing to email a demo address');\n    return { to: redirectTo, subject: `[demo → ${to}] ${subject}`, body };\n  }\n  return { to, subject, body };\n}\n\nfunction errorPage(errors) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review not accepted</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>Review not accepted</h1><ul>${errors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}</ul><p>Go back, fix the form and submit again. Nothing was sent.</p></body></html>`;\n}\n\nfunction receiptPage(text) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review received</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>${escapeHtml(text)}</h1></body></html>`;\n}\n\nconst ctx = $('Build review page').first().json;\nconst input = $input.first().json;\nconst body = Object.prototype.hasOwnProperty.call(input, 'body') ? input.body : undefined;\nconst result = parseDecision(body, ctx.draft);\nreturn [{ json: { ...ctx, result, errorHtml: errorPage(result.errors || []), receiptHtml: receiptPage(result.decision === 'approve' ? 'Review received: approved and sent' : 'Review received: rejected, nothing sent') } }];"
+      }
+    },
+    {
+      "id": "timed-out",
+      "name": "Timed out?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7000,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "timed-out-condition",
+              "leftValue": "={{ $json.result.timedOut }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "review-complete",
+      "name": "Review complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7220,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "review-complete-condition",
+              "leftValue": "={{ $json.result.errors.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "respond-fix-the-form",
+      "name": "Respond: fix the form",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        7440,
+        320
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.errorHtml }}",
+        "options": {
+          "responseCode": 422,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "approved",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7440,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "approved-condition",
+              "leftValue": "={{ $json.result.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "prepare-email",
+      "name": "Prepare email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7660,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Human approval: review page, decision parsing and the outgoing reply (SPEC §6).\n\nfunction escapeHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;');\n}\n\nfunction safeId(sourceId) {\n  return String(sourceId || 'unknown').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);\n}\n\nconst TIER_LABEL = { qualified: 'Qualified', needs_review: 'Needs review', not_qualified: 'Not qualified' };\n\nfunction buildReviewPage({ inquiry, qualification, draft, contactUrl, resumeUrl }) {\n  const row = (label, value) => `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`;\n  return `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Reply review: ${escapeHtml(inquiry.name || inquiry.email || 'new lead')}</title>\n<style>body{font:16px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 16px;background:#f4f6f8;color:#1d2430}\nsection{background:#fff;border-radius:10px;padding:1rem 1.25rem;margin:1rem 0;box-shadow:0 1px 2px #0001}\nh1{font-size:1.4rem}h2{font-size:1.05rem;margin:.2rem 0 .8rem}th{text-align:left;color:#5b6575;font-weight:600;padding:.2rem 1rem .2rem 0;vertical-align:top;white-space:nowrap}\n.msg{white-space:pre-wrap;background:#f7f8fa;border-radius:6px;padding:.75rem}.tier{display:inline-block;border-radius:999px;padding:.1rem .6rem;background:#e7f0ff;color:#1747a6;font-weight:600}\nlabel{display:block;margin:.8rem 0 .3rem;font-weight:600}input[type=text],textarea{width:100%;box-sizing:border-box;font:inherit;padding:.5rem;border:1px solid #c9cfd8;border-radius:6px}\ntextarea{min-height:12rem}.choices label{display:inline-block;font-weight:500;margin-right:1.5rem}button{font:inherit;font-weight:600;background:#1d4ed8;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;cursor:pointer}\n.note{color:#5b6575;font-size:.9rem}</style></head><body>\n<h1>Review the AI draft before anything is sent</h1>\n<section><h2>Inquiry</h2><table>\n${row('From', `${inquiry.name || '(no name)'} <${inquiry.email || 'no email'}>`)}\n${row('Phone', inquiry.phone || '(not given)')}\n${row('Company', inquiry.company || '(not given)')}\n${row('Source', `${inquiry.source} · ${inquiry.received_at}`)}\n${row('Subject', inquiry.subject || '(none)')}\n</table><p class=\"msg\">${escapeHtml(inquiry.message)}</p>\n<p><a href=\"${escapeHtml(contactUrl)}\">Open contact in HubSpot</a></p></section>\n<section><h2>AI classification</h2><p><span class=\"tier\">${escapeHtml(TIER_LABEL[qualification.tier] || qualification.tier)}</span> · ${escapeHtml(qualification.topic)} · urgency ${escapeHtml(qualification.urgency)}</p><p>${escapeHtml(qualification.reason)}</p></section>\n<section><h2>Draft reply</h2><form method=\"POST\" action=\"${escapeHtml(resumeUrl)}\" enctype=\"application/x-www-form-urlencoded\">\n<label for=\"subject\">Subject</label><input type=\"text\" id=\"subject\" name=\"subject\" value=\"${escapeHtml(draft.subject)}\">\n<label for=\"body\">Message</label><textarea id=\"body\" name=\"body\">${escapeHtml(draft.body)}</textarea>\n<label>Decision</label><div class=\"choices\"><label><input type=\"radio\" name=\"decision\" value=\"approve\"> Approve and send</label><label><input type=\"radio\" name=\"decision\" value=\"reject\"> Reject, send nothing</label></div>\n<label for=\"reviewer\">Your name</label><input type=\"text\" id=\"reviewer\" name=\"reviewer\" required>\n<p class=\"note\">Nothing is sent until you approve. Your name is saved on the HubSpot contact with the decision.</p>\n<button type=\"submit\">Submit review</button></form></section></body></html>`;\n}\n\nfunction parseDecision(body, draft) {\n  if (body == null) return { timedOut: true, errors: [] };\n  const errors = [];\n  const reviewer = String(body.reviewer || '').trim();\n  const decision = String(body.decision || '').trim();\n  if (!reviewer) errors.push('Your name is required');\n  if (!['approve', 'reject'].includes(decision)) errors.push('Choose Approve or Reject');\n  const subject = String(body.subject ?? draft.subject).trim();\n  const text = String(body.body ?? draft.body).replace(/\\r\\n/g, '\\n').trim();\n  if (decision === 'approve' && (!subject || !text)) errors.push('Subject and message cannot be empty');\n  const edited = subject !== String(draft.subject).trim() || text !== String(draft.body).replace(/\\r\\n/g, '\\n').trim();\n  return { timedOut: false, errors, reviewer, decision, subject, body: text, edited };\n}\n\nfunction outgoingEmail({ to, subject, body, demoMode, redirectTo }) {\n  if (demoMode) {\n    if (!redirectTo) throw new Error('DEMO_MODE=1 needs REPLY_REDIRECT_TO; refusing to email a demo address');\n    return { to: redirectTo, subject: `[demo → ${to}] ${subject}`, body };\n  }\n  return { to, subject, body };\n}\n\nfunction errorPage(errors) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review not accepted</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>Review not accepted</h1><ul>${errors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}</ul><p>Go back, fix the form and submit again. Nothing was sent.</p></body></html>`;\n}\n\nfunction receiptPage(text) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review received</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>${escapeHtml(text)}</h1></body></html>`;\n}\n\nconst ctx = $input.first().json;\nconst email = outgoingEmail({ to: ctx.inquiry.email, subject: ctx.result.subject, body: ctx.result.body, demoMode: $env.DEMO_MODE === '1', redirectTo: $env.REPLY_REDIRECT_TO });\nreturn [{ json: { ...ctx, email } }];"
+      }
+    },
+    {
+      "id": "send-reply",
+      "name": "Send reply",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        7880,
+        0
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "gmailSmtpCred01",
+          "name": "Gmail SMTP (demo inbox)"
+        }
+      },
+      "parameters": {
+        "fromEmail": "={{ \"Tidewell Commercial Cleaning <\" + $env.GMAIL_ADDRESS + \">\" }}",
+        "toEmail": "={{ $json.email.to }}",
+        "subject": "={{ $json.email.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.email.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      }
+    },
+    {
+      "id": "mark-sent",
+      "name": "Mark sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8100,
+        0
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $('Prepare email').first().json }];"
+      }
+    },
+    {
+      "id": "respond-sent",
+      "name": "Respond: sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        8320,
+        0
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.receiptHtml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "respond-rejected",
+      "name": "Respond: rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        7660,
+        200
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.receiptHtml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prepare-decision-note",
+      "name": "Prepare decision note",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8540,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// HubSpot notes, Slack texts and the run log; every number here comes from code, not the AI.\n\nfunction escapeNoteHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nconst paragraph = (text) => `<p>${escapeNoteHtml(text).replace(/\\n/g, '<br>')}</p>`;\n\nfunction inquiryNoteHtml(inquiry, qualification) {\n  return [\n    paragraph(`[${inquiry.source}] ${inquiry.received_at}`),\n    inquiry.subject ? paragraph(inquiry.subject) : '',\n    paragraph(inquiry.message),\n    paragraph(`AI: ${qualification.tier} / ${qualification.topic} / ${qualification.urgency} — ${qualification.reason}`),\n  ].join('');\n}\n\nfunction decisionNoteHtml(result, { date, sentTo }) {\n  if (result.timedOut) return paragraph('Reply drafted by AI; review timed out, nothing sent.');\n  if (result.decision === 'approve') return paragraph(`Reply drafted by AI, edited: ${result.edited ? 'yes' : 'no'}, approved by ${result.reviewer} on ${date}, sent to ${sentTo}.\\n\\nSubject: ${result.subject}\\n\\n${result.body}`);\n  return paragraph(`Reply drafted by AI, rejected by ${result.reviewer} on ${date}, nothing sent.`);\n}\n\nfunction noteRequest(contactId, html, timestamp = new Date().toISOString()) {\n  return {\n    properties: { hs_timestamp: timestamp, hs_note_body: html },\n    associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }] }],\n  };\n}\n\nfunction contactUrl(portalId, contactId) {\n  return portalId ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}` : `https://app.hubspot.com/contacts/record/0-1/${contactId}`;\n}\n\nfunction maskSecrets(value) {\n  return String(value ?? '')\n    .replace(/Bearer\\s+[^\\s\"']+/gi, 'Bearer ***')\n    .replace(/\\bsk-[A-Za-z0-9_-]+/g, '***')\n    .replace(/\\bpat-[A-Za-z0-9-]+/g, '***')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/g, 'https://hooks.slack.com/***');\n}\n\nfunction formatAlert(payload = {}, baseUrl = 'http://localhost:5679') {\n  const workflow = payload.workflow || {};\n  const execution = payload.execution || {};\n  const message = maskSecrets((execution.error && execution.error.message) || 'Unknown error');\n  const url = `${baseUrl}/workflow/${workflow.id || ''}/executions/${execution.id || ''}`;\n  return { text: `:rotating_light: Lead intake workflow error\\nWorkflow: ${workflow.name || workflow.id || 'unknown'}\\nNode: ${execution.lastNodeExecuted || 'unknown'}\\nError: ${message}\\n${url}`, url };\n}\n\nfunction rejectedInputAlert(inquiry, reason) {\n  const who = inquiry.email || inquiry.phone || inquiry.name || 'unknown sender';\n  return `:warning: Inquiry not accepted (${reason}) from ${who} via ${inquiry.source}. Nothing was written to HubSpot; please follow up by hand if needed.`;\n}\n\nfunction llmFailureAlert(inquiry, qualification, link) {\n  return `:warning: AI classification failed for ${inquiry.email || inquiry.phone} (${qualification.llm_error}). The lead was saved as Needs review with no draft reply: ${link}`;\n}\n\nfunction reviewAlert(inquiry, qualification, reviewUrl) {\n  return `:incoming_envelope: New lead: ${inquiry.name || inquiry.email} (${qualification.tier}, ${qualification.urgency} urgency) — review the draft reply: ${reviewUrl}`;\n}\n\nfunction buildRunLog({ inquiry, fixtureId = null, contactId = null, action, qualification = null, draft = 'none', sentTo = null, reviewer = null, edited = null, alerts = [], executionId = null }) {\n  return {\n    ts: new Date().toISOString(),\n    execution_id: executionId,\n    source_id: inquiry.source_id,\n    source: inquiry.source,\n    fixture_id: fixtureId,\n    email: inquiry.email,\n    contact_id: contactId,\n    action,\n    tier: qualification ? qualification.tier : null,\n    llm_ok: qualification ? qualification.llm_ok : null,\n    llm_error: qualification ? qualification.llm_error : null,\n    draft,\n    reviewer,\n    edited,\n    sent_to: sentTo,\n    alerts,\n  };\n}\n\nconst ctx = $input.first().json;\nconst r = ctx.result;\nconst date = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });\nconst approved = !r.timedOut && r.decision === 'approve';\nconst sentTo = approved ? ctx.email.to : null;\nconst draft = r.timedOut ? 'timeout' : approved ? 'approved' : 'rejected';\nconst runLog = { inquiry: ctx.inquiry, contactId: ctx.contactId, action: ctx.action, qualification: ctx.qualification, draft, sentTo, reviewer: r.reviewer || null, edited: r.timedOut ? null : r.edited, alerts: [] };\nreturn [{ json: { note: noteRequest(ctx.contactId, decisionNoteHtml(r, { date, sentTo })), runLog } }];"
+      }
+    },
+    {
+      "id": "create-decision-note",
+      "name": "Create decision note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        8760,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "hubspotTokenCred01",
+          "name": "HubSpot service key"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.hubapi.com' + '/crm/v3/objects/notes' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.note) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "restore-run-log",
+      "name": "Restore run log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8980,
+        200
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { runLog: $('Prepare decision note').first().json.runLog } }];"
+      }
+    },
+    {
+      "id": "write-run-log",
+      "name": "Write run log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9200,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Human approval: review page, decision parsing and the outgoing reply (SPEC §6).\n\nfunction escapeHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;');\n}\n\nfunction safeId(sourceId) {\n  return String(sourceId || 'unknown').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);\n}\n\nconst TIER_LABEL = { qualified: 'Qualified', needs_review: 'Needs review', not_qualified: 'Not qualified' };\n\nfunction buildReviewPage({ inquiry, qualification, draft, contactUrl, resumeUrl }) {\n  const row = (label, value) => `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(value)}</td></tr>`;\n  return `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Reply review: ${escapeHtml(inquiry.name || inquiry.email || 'new lead')}</title>\n<style>body{font:16px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 16px;background:#f4f6f8;color:#1d2430}\nsection{background:#fff;border-radius:10px;padding:1rem 1.25rem;margin:1rem 0;box-shadow:0 1px 2px #0001}\nh1{font-size:1.4rem}h2{font-size:1.05rem;margin:.2rem 0 .8rem}th{text-align:left;color:#5b6575;font-weight:600;padding:.2rem 1rem .2rem 0;vertical-align:top;white-space:nowrap}\n.msg{white-space:pre-wrap;background:#f7f8fa;border-radius:6px;padding:.75rem}.tier{display:inline-block;border-radius:999px;padding:.1rem .6rem;background:#e7f0ff;color:#1747a6;font-weight:600}\nlabel{display:block;margin:.8rem 0 .3rem;font-weight:600}input[type=text],textarea{width:100%;box-sizing:border-box;font:inherit;padding:.5rem;border:1px solid #c9cfd8;border-radius:6px}\ntextarea{min-height:12rem}.choices label{display:inline-block;font-weight:500;margin-right:1.5rem}button{font:inherit;font-weight:600;background:#1d4ed8;color:#fff;border:0;border-radius:6px;padding:.6rem 1.2rem;cursor:pointer}\n.note{color:#5b6575;font-size:.9rem}</style></head><body>\n<h1>Review the AI draft before anything is sent</h1>\n<section><h2>Inquiry</h2><table>\n${row('From', `${inquiry.name || '(no name)'} <${inquiry.email || 'no email'}>`)}\n${row('Phone', inquiry.phone || '(not given)')}\n${row('Company', inquiry.company || '(not given)')}\n${row('Source', `${inquiry.source} · ${inquiry.received_at}`)}\n${row('Subject', inquiry.subject || '(none)')}\n</table><p class=\"msg\">${escapeHtml(inquiry.message)}</p>\n<p><a href=\"${escapeHtml(contactUrl)}\">Open contact in HubSpot</a></p></section>\n<section><h2>AI classification</h2><p><span class=\"tier\">${escapeHtml(TIER_LABEL[qualification.tier] || qualification.tier)}</span> · ${escapeHtml(qualification.topic)} · urgency ${escapeHtml(qualification.urgency)}</p><p>${escapeHtml(qualification.reason)}</p></section>\n<section><h2>Draft reply</h2><form method=\"POST\" action=\"${escapeHtml(resumeUrl)}\" enctype=\"application/x-www-form-urlencoded\">\n<label for=\"subject\">Subject</label><input type=\"text\" id=\"subject\" name=\"subject\" value=\"${escapeHtml(draft.subject)}\">\n<label for=\"body\">Message</label><textarea id=\"body\" name=\"body\">${escapeHtml(draft.body)}</textarea>\n<label>Decision</label><div class=\"choices\"><label><input type=\"radio\" name=\"decision\" value=\"approve\"> Approve and send</label><label><input type=\"radio\" name=\"decision\" value=\"reject\"> Reject, send nothing</label></div>\n<label for=\"reviewer\">Your name</label><input type=\"text\" id=\"reviewer\" name=\"reviewer\" required>\n<p class=\"note\">Nothing is sent until you approve. Your name is saved on the HubSpot contact with the decision.</p>\n<button type=\"submit\">Submit review</button></form></section></body></html>`;\n}\n\nfunction parseDecision(body, draft) {\n  if (body == null) return { timedOut: true, errors: [] };\n  const errors = [];\n  const reviewer = String(body.reviewer || '').trim();\n  const decision = String(body.decision || '').trim();\n  if (!reviewer) errors.push('Your name is required');\n  if (!['approve', 'reject'].includes(decision)) errors.push('Choose Approve or Reject');\n  const subject = String(body.subject ?? draft.subject).trim();\n  const text = String(body.body ?? draft.body).replace(/\\r\\n/g, '\\n').trim();\n  if (decision === 'approve' && (!subject || !text)) errors.push('Subject and message cannot be empty');\n  const edited = subject !== String(draft.subject).trim() || text !== String(draft.body).replace(/\\r\\n/g, '\\n').trim();\n  return { timedOut: false, errors, reviewer, decision, subject, body: text, edited };\n}\n\nfunction outgoingEmail({ to, subject, body, demoMode, redirectTo }) {\n  if (demoMode) {\n    if (!redirectTo) throw new Error('DEMO_MODE=1 needs REPLY_REDIRECT_TO; refusing to email a demo address');\n    return { to: redirectTo, subject: `[demo → ${to}] ${subject}`, body };\n  }\n  return { to, subject, body };\n}\n\nfunction errorPage(errors) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review not accepted</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>Review not accepted</h1><ul>${errors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}</ul><p>Go back, fix the form and submit again. Nothing was sent.</p></body></html>`;\n}\n\nfunction receiptPage(text) {\n  return `<!doctype html><html><head><meta charset=\"utf-8\"><title>Review received</title></head><body style=\"font:16px system-ui;max-width:640px;margin:3rem auto\"><h1>${escapeHtml(text)}</h1></body></html>`;\n}\n\n// HubSpot notes, Slack texts and the run log; every number here comes from code, not the AI.\n\nfunction escapeNoteHtml(value) {\n  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nconst paragraph = (text) => `<p>${escapeNoteHtml(text).replace(/\\n/g, '<br>')}</p>`;\n\nfunction inquiryNoteHtml(inquiry, qualification) {\n  return [\n    paragraph(`[${inquiry.source}] ${inquiry.received_at}`),\n    inquiry.subject ? paragraph(inquiry.subject) : '',\n    paragraph(inquiry.message),\n    paragraph(`AI: ${qualification.tier} / ${qualification.topic} / ${qualification.urgency} — ${qualification.reason}`),\n  ].join('');\n}\n\nfunction decisionNoteHtml(result, { date, sentTo }) {\n  if (result.timedOut) return paragraph('Reply drafted by AI; review timed out, nothing sent.');\n  if (result.decision === 'approve') return paragraph(`Reply drafted by AI, edited: ${result.edited ? 'yes' : 'no'}, approved by ${result.reviewer} on ${date}, sent to ${sentTo}.\\n\\nSubject: ${result.subject}\\n\\n${result.body}`);\n  return paragraph(`Reply drafted by AI, rejected by ${result.reviewer} on ${date}, nothing sent.`);\n}\n\nfunction noteRequest(contactId, html, timestamp = new Date().toISOString()) {\n  return {\n    properties: { hs_timestamp: timestamp, hs_note_body: html },\n    associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }] }],\n  };\n}\n\nfunction contactUrl(portalId, contactId) {\n  return portalId ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}` : `https://app.hubspot.com/contacts/record/0-1/${contactId}`;\n}\n\nfunction maskSecrets(value) {\n  return String(value ?? '')\n    .replace(/Bearer\\s+[^\\s\"']+/gi, 'Bearer ***')\n    .replace(/\\bsk-[A-Za-z0-9_-]+/g, '***')\n    .replace(/\\bpat-[A-Za-z0-9-]+/g, '***')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/g, 'https://hooks.slack.com/***');\n}\n\nfunction formatAlert(payload = {}, baseUrl = 'http://localhost:5679') {\n  const workflow = payload.workflow || {};\n  const execution = payload.execution || {};\n  const message = maskSecrets((execution.error && execution.error.message) || 'Unknown error');\n  const url = `${baseUrl}/workflow/${workflow.id || ''}/executions/${execution.id || ''}`;\n  return { text: `:rotating_light: Lead intake workflow error\\nWorkflow: ${workflow.name || workflow.id || 'unknown'}\\nNode: ${execution.lastNodeExecuted || 'unknown'}\\nError: ${message}\\n${url}`, url };\n}\n\nfunction rejectedInputAlert(inquiry, reason) {\n  const who = inquiry.email || inquiry.phone || inquiry.name || 'unknown sender';\n  return `:warning: Inquiry not accepted (${reason}) from ${who} via ${inquiry.source}. Nothing was written to HubSpot; please follow up by hand if needed.`;\n}\n\nfunction llmFailureAlert(inquiry, qualification, link) {\n  return `:warning: AI classification failed for ${inquiry.email || inquiry.phone} (${qualification.llm_error}). The lead was saved as Needs review with no draft reply: ${link}`;\n}\n\nfunction reviewAlert(inquiry, qualification, reviewUrl) {\n  return `:incoming_envelope: New lead: ${inquiry.name || inquiry.email} (${qualification.tier}, ${qualification.urgency} urgency) — review the draft reply: ${reviewUrl}`;\n}\n\nfunction buildRunLog({ inquiry, fixtureId = null, contactId = null, action, qualification = null, draft = 'none', sentTo = null, reviewer = null, edited = null, alerts = [], executionId = null }) {\n  return {\n    ts: new Date().toISOString(),\n    execution_id: executionId,\n    source_id: inquiry.source_id,\n    source: inquiry.source,\n    fixture_id: fixtureId,\n    email: inquiry.email,\n    contact_id: contactId,\n    action,\n    tier: qualification ? qualification.tier : null,\n    llm_ok: qualification ? qualification.llm_ok : null,\n    llm_error: qualification ? qualification.llm_error : null,\n    draft,\n    reviewer,\n    edited,\n    sent_to: sentTo,\n    alerts,\n  };\n}\n\n// OpenAI requests and the checks that decide whether an AI answer can be used (SPEC §5).\n\nconst TIERS = ['qualified', 'needs_review', 'not_qualified'];\nconst TOPICS = ['regular_cleaning', 'deep_cleaning', 'quote_request', 'complaint', 'job_application', 'sales_pitch', 'other'];\nconst URGENCIES = ['high', 'normal', 'low'];\nconst BROKEN_MODEL = 'does-not-exist-model';\n\nfunction fillTemplate(template, values) {\n  return String(template).replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => (values[key] == null ? '' : String(values[key])));\n}\n\nfunction inquiryText(inquiry) {\n  return [\n    `Source: ${inquiry.source}`,\n    `Name: ${inquiry.name || '(not given)'}`,\n    `Company: ${inquiry.company || '(not given)'}`,\n    `Subject: ${inquiry.subject || '(none)'}`,\n    'Message:',\n    inquiry.message,\n  ].join('\\n');\n}\n\nfunction chatRequest(prompt, userContent, schemaName, modelOverride) {\n  const request = {\n    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: userContent }],\n    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema: prompt.schema } },\n    temperature: 0,\n  };\n  if (modelOverride) request.model = modelOverride;\n  return request;\n}\n\nfunction buildQualifyRequest(inquiry, prompt) {\n  const override = inquiry.demo_flags && inquiry.demo_flags.break_llm ? BROKEN_MODEL : undefined;\n  return chatRequest(prompt, fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry) }), 'lead_qualification', override);\n}\n\nfunction buildDraftRequest(inquiry, qualification, prompt) {\n  const content = fillTemplate(prompt.userTemplate, { inquiry: inquiryText(inquiry), tier: qualification.tier, topic: qualification.topic, urgency: qualification.urgency });\n  return chatRequest(prompt, content, 'reply_draft');\n}\n\nfunction readLlmJson(response) {\n  if (!response) return { data: null, error: 'empty_response' };\n  if (response.error) {\n    const error = response.error;\n    const status = error.httpCode || error.status || (error.cause && error.cause.status) || '';\n    return { data: null, error: `api_error${status ? `_${status}` : ''}` };\n  }\n  const content = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!content) return { data: null, error: 'empty_response' };\n  try {\n    return { data: JSON.parse(content), error: null };\n  } catch (e) {\n    return { data: null, error: 'invalid_json' };\n  }\n}\n\nconst squash = (text) => String(text || '').replace(/\\s+/g, ' ').trim().toLowerCase();\n\nfunction validateQualification(data, message) {\n  const errors = [];\n  if (!data || typeof data !== 'object') return { valid: false, errors: ['not_an_object'] };\n  if (!TIERS.includes(data.tier)) errors.push('bad_tier');\n  if (!TOPICS.includes(data.topic)) errors.push('bad_topic');\n  if (!URGENCIES.includes(data.urgency)) errors.push('bad_urgency');\n  if (!String(data.reason || '').trim()) errors.push('missing_reason');\n  const quote = squash(data.quote);\n  if (!quote || !squash(message).includes(quote)) errors.push('quote_not_in_message');\n  return { valid: errors.length === 0, errors };\n}\n\n// A verbatim quote that runs long is cut at a word boundary; it stays a prefix of the original text.\nconst QUOTE_LIMIT = 160;\nfunction shortenQuote(quote) {\n  const text = String(quote).replace(/\\s+/g, ' ').trim();\n  if (text.length <= QUOTE_LIMIT) return text;\n  const cut = text.slice(0, QUOTE_LIMIT);\n  return `${cut.slice(0, cut.lastIndexOf(' ') > 40 ? cut.lastIndexOf(' ') : QUOTE_LIMIT).replace(/[\\s,;:.]+$/, '')}…`;\n}\n\nfunction qualificationFromLlm(response, message) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return fallbackQualification(parsed.error);\n  const checked = validateQualification(parsed.data, message);\n  if (!checked.valid) return fallbackQualification(`validation_failed:${checked.errors.join(',')}`);\n  const { tier, topic, urgency, reason, quote } = parsed.data;\n  return { tier, topic, urgency, reason: `${reason.trim()} Quote: \"${shortenQuote(quote)}\"`, llm_ok: true, llm_error: null };\n}\n\nfunction fallbackQualification(errorClass) {\n  return {\n    tier: 'needs_review',\n    topic: 'other',\n    urgency: 'normal',\n    reason: `AI classification failed: ${errorClass}; needs a human look.`,\n    llm_ok: false,\n    llm_error: errorClass,\n  };\n}\n\nfunction draftFromLlm(response) {\n  const parsed = readLlmJson(response);\n  if (parsed.error) return { ok: false, error: parsed.error };\n  const { subject, body } = parsed.data || {};\n  const words = String(body || '').trim().split(/\\s+/).filter(Boolean).length;\n  if (!String(subject || '').trim() || !words) return { ok: false, error: 'missing_subject_or_body' };\n  if (words > 160) return { ok: false, error: 'body_too_long' };\n  return { ok: true, subject: subject.trim(), body: body.trim() };\n}\n\nfunction fixtureIdFor(sourceId, fixtures = []) {\n  for (const fixture of fixtures) {\n    if (fixture.channel === 'form' && sourceId === `form:${fixture.submission_id}`) return fixture.id;\n    if (fixture.channel === 'email' && sourceId === `email:${fixture.message_id}`) return fixture.id;\n  }\n  return null;\n}\n\n// Mock mode reads a stored answer instead of calling OpenAI; a missing file behaves like an API failure.\nfunction mockResponse(fileContent, breakLlm) {\n  if (breakLlm) return { error: { message: `The model \\`${BROKEN_MODEL}\\` does not exist (mock)`, httpCode: '404' } };\n  if (!fileContent) return { error: { message: 'mock file missing', httpCode: 'mock_missing' } };\n  return { choices: [{ message: { content: fileContent } }] };\n}\n\nconst fs = require('fs');\nconst entry = $input.first().json.runLog;\nconst fixtures = JSON.parse(require('fs').readFileSync('/files/sample-data/fixtures.json', 'utf8')).fixtures;\nconst log = buildRunLog({ ...entry, fixtureId: fixtureIdFor(entry.inquiry.source_id, fixtures), executionId: $execution.id });\nconst name = safeId(entry.inquiry.source_id);\nfs.mkdirSync('/files/output/run-log', { recursive: true });\nfs.writeFileSync('/files/output/run-log/' + Date.now() + '-' + name + '.json', JSON.stringify(log, null, 2), 'utf8');\nconst reviewFile = '/files/output/review/' + name + '.json';\nif (log.draft !== 'none' && fs.existsSync(reviewFile)) {\n  const review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));\n  fs.writeFileSync(reviewFile, JSON.stringify({ ...review, status: log.draft, closed_at: log.ts }, null, 2), 'utf8');\n}\nreturn [{ json: log }];"
+      }
+    },
+    {
+      "id": "any-alerts",
+      "name": "Any alerts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        9420,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "any-alerts-condition",
+              "leftValue": "={{ $json.alerts.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "send-alert",
+      "name": "Send alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        9640,
+        320
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.alerts.join('\\n') }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Has email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has email?": {
+      "main": [
+        [
+          {
+            "node": "Get contact by email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip email lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get contact by email": {
+      "main": [
+        [
+          {
+            "node": "Read email lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read email lookup": {
+      "main": [
+        [
+          {
+            "node": "Try phone?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip email lookup": {
+      "main": [
+        [
+          {
+            "node": "Try phone?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Try phone?": {
+      "main": [
+        [
+          {
+            "node": "Search contact by phone",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search contact by phone": {
+      "main": [
+        [
+          {
+            "node": "Read phone lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read phone lookup": {
+      "main": [
+        [
+          {
+            "node": "Check duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check duplicate": {
+      "main": [
+        [
+          {
+            "node": "Repeat submission?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repeat submission?": {
+      "main": [
+        [
+          {
+            "node": "Log repeat submission",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build qualify request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log repeat submission": {
+      "main": [
+        [
+          {
+            "node": "Write run log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build qualify request": {
+      "main": [
+        [
+          {
+            "node": "Use live LLM?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use live LLM?": {
+      "main": [
+        [
+          {
+            "node": "Qualify (OpenAI)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load mock qualification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qualify (OpenAI)": {
+      "main": [
+        [
+          {
+            "node": "Apply qualification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load mock qualification": {
+      "main": [
+        [
+          {
+            "node": "Apply qualification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply qualification": {
+      "main": [
+        [
+          {
+            "node": "Existing contact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Existing contact?": {
+      "main": [
+        [
+          {
+            "node": "Update contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create contact": {
+      "main": [
+        [
+          {
+            "node": "Read create result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read create result": {
+      "main": [
+        [
+          {
+            "node": "Already exists (409)?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already exists (409)?": {
+      "main": [
+        [
+          {
+            "node": "Get existing contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare inquiry note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get existing contact": {
+      "main": [
+        [
+          {
+            "node": "Rebuild properties",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rebuild properties": {
+      "main": [
+        [
+          {
+            "node": "Update contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update contact": {
+      "main": [
+        [
+          {
+            "node": "Prepare inquiry note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare inquiry note": {
+      "main": [
+        [
+          {
+            "node": "Create inquiry note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create inquiry note": {
+      "main": [
+        [
+          {
+            "node": "Restore context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore context": {
+      "main": [
+        [
+          {
+            "node": "Draft a reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft a reply?": {
+      "main": [
+        [
+          {
+            "node": "Build draft request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log without draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log without draft": {
+      "main": [
+        [
+          {
+            "node": "Write run log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build draft request": {
+      "main": [
+        [
+          {
+            "node": "Use live LLM? (draft)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use live LLM? (draft)": {
+      "main": [
+        [
+          {
+            "node": "Draft reply (OpenAI)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load mock draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft reply (OpenAI)": {
+      "main": [
+        [
+          {
+            "node": "Check draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load mock draft": {
+      "main": [
+        [
+          {
+            "node": "Check draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check draft": {
+      "main": [
+        [
+          {
+            "node": "Draft usable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft usable?": {
+      "main": [
+        [
+          {
+            "node": "Build review page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log draft failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log draft failure": {
+      "main": [
+        [
+          {
+            "node": "Write run log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build review page": {
+      "main": [
+        [
+          {
+            "node": "Notify reviewer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify reviewer": {
+      "main": [
+        [
+          {
+            "node": "Wait for review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for review": {
+      "main": [
+        [
+          {
+            "node": "Read decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read decision": {
+      "main": [
+        [
+          {
+            "node": "Timed out?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Timed out?": {
+      "main": [
+        [
+          {
+            "node": "Prepare decision note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Review complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review complete?": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: fix the form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond: fix the form": {
+      "main": [
+        [
+          {
+            "node": "Wait for review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Prepare email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare email": {
+      "main": [
+        [
+          {
+            "node": "Send reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reply": {
+      "main": [
+        [
+          {
+            "node": "Mark sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark sent": {
+      "main": [
+        [
+          {
+            "node": "Respond: sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond: sent": {
+      "main": [
+        [
+          {
+            "node": "Prepare decision note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond: rejected": {
+      "main": [
+        [
+          {
+            "node": "Prepare decision note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare decision note": {
+      "main": [
+        [
+          {
+            "node": "Create decision note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create decision note": {
+      "main": [
+        [
+          {
+            "node": "Restore run log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore run log": {
+      "main": [
+        [
+          {
+            "node": "Write run log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write run log": {
+      "main": [
+        [
+          {
+            "node": "Any alerts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any alerts?": {
+      "main": [
+        [
+          {
+            "node": "Send alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {},
+  "versionId": "1"
+}
