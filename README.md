@@ -111,4 +111,4 @@ This is a self-initiated portfolio project. The company, people and inquiries ar
 
 ## License
 
-Shared as a portfolio sample for review. It is not licensed for reuse.
+Copyright © 2026 rikkadawufa. All rights reserved. No license is granted to use, copy, modify, or distribute this code.
