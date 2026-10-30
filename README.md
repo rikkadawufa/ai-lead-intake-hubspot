@@ -67,7 +67,7 @@ Runs on a real HubSpot Free account, a Gmail test inbox and Slack, with n8n runn
 - Live OpenAI (`gpt-4.1-mini`), first run: 4/8. The AI classified T1 correctly, but its quote was longer than the check allowed, so T1 was set aside for a human and the later steps failed with it. The check now shortens long quotes that are still word for word.
 - Live OpenAI, second run: 8/8.
 
-Details, including what went wrong along the way, are in [docs/VERIFICATION.md](docs/VERIFICATION.md) (in Traditional Chinese).
+Details, including what went wrong along the way, are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Known limitations
 
